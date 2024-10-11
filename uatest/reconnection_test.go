@@ -90,6 +90,7 @@ func TestAutoReconnection(t *testing.T) {
 		sctx,
 		&opcua.SubscriptionParameters{Interval: opcua.DefaultSubscriptionInterval},
 		ch,
+		false,
 		currentTimeNodeID,
 	)
 	if err != nil {

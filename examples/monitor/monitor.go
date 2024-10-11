@@ -11,6 +11,7 @@ import (
 
 	"github.com/gopcua/opcua"
 	"github.com/gopcua/opcua/debug"
+	"github.com/gopcua/opcua/id"
 	"github.com/gopcua/opcua/monitor"
 	"github.com/gopcua/opcua/ua"
 )
@@ -24,6 +25,7 @@ func main() {
 		keyFile  = flag.String("key", "", "Path to private key.pem. Required for security mode/policy != None")
 		nodeID   = flag.String("node", "", "node id to subscribe to")
 		interval = flag.Duration("interval", opcua.DefaultSubscriptionInterval, "subscription interval")
+		event    = flag.Bool("event", false, "are you subscribing to events")
 	)
 	flag.BoolVar(&debug.Enable, "debug", false, "enable debug logging")
 	flag.Parse()
@@ -83,19 +85,82 @@ func main() {
 	})
 	wg := &sync.WaitGroup{}
 
-	// start callback-based subscription
-	wg.Add(1)
-	go startCallbackSub(ctx, m, *interval, 0, wg, *nodeID)
+	fieldNames := []string{"EventId", "EventType", "Severity", "Time", "Message"}
+	selects := make([]*ua.SimpleAttributeOperand, len(fieldNames))
+	for i, name := range fieldNames {
+		selects[i] = &ua.SimpleAttributeOperand{
+			TypeDefinitionID: ua.NewNumericNodeID(0, id.BaseEventType),
+			BrowsePath:       []*ua.QualifiedName{{NamespaceIndex: 0, Name: name}},
+			AttributeID:      ua.AttributeIDValue,
+		}
+	}
 
-	// start channel-based subscription
-	wg.Add(1)
-	go startChanSub(ctx, m, *interval, 0, wg, *nodeID)
+	wheres := &ua.ContentFilter{
+		Elements: []*ua.ContentFilterElement{
+			{
+				FilterOperator: ua.FilterOperatorGreaterThanOrEqual,
+				FilterOperands: []*ua.ExtensionObject{
+					{
+						EncodingMask: 1,
+						TypeID: &ua.ExpandedNodeID{
+							NodeID: ua.NewNumericNodeID(0, id.SimpleAttributeOperand_Encoding_DefaultBinary),
+						},
+						Value: ua.SimpleAttributeOperand{
+							TypeDefinitionID: ua.NewNumericNodeID(0, id.BaseEventType),
+							BrowsePath:       []*ua.QualifiedName{{NamespaceIndex: 0, Name: "Severity"}},
+							AttributeID:      ua.AttributeIDValue,
+						},
+					},
+					{
+						EncodingMask: 1,
+						TypeID: &ua.ExpandedNodeID{
+							NodeID: ua.NewNumericNodeID(0, id.LiteralOperand_Encoding_DefaultBinary),
+						},
+						Value: ua.LiteralOperand{
+							Value: ua.MustVariant(uint16(0)),
+						},
+					},
+				},
+			},
+		},
+	}
 
+	filter := ua.EventFilter{
+		SelectClauses: selects,
+		WhereClause:   wheres,
+	}
+
+	filterExtObj := ua.ExtensionObject{
+		EncodingMask: ua.ExtensionObjectBinary,
+		TypeID: &ua.ExpandedNodeID{
+			NodeID: ua.NewNumericNodeID(0, id.EventFilter_Encoding_DefaultBinary),
+		},
+		Value: filter,
+	}
+
+	if *event {
+		// start callback-based subscription
+		wg.Add(1)
+		go startCallbackSub(ctx, m, *interval, 0, wg, *event, filterExtObj, *nodeID)
+
+		// start channel-based subscription
+		wg.Add(1)
+		go startChanSub(ctx, m, *interval, 0, wg, *event, filterExtObj, *nodeID)
+	} else {
+		// start callback-based subscription
+		wg.Add(1)
+		go startCallbackSub(ctx, m, *interval, 0, wg, *event, nil, *nodeID)
+
+		// start channel-based subscription
+		wg.Add(1)
+		go startChanSub(ctx, m, *interval, 0, wg, *event, nil, *nodeID)
+	}
 	<-ctx.Done()
 	wg.Wait()
 }
 
-func startCallbackSub(ctx context.Context, m *monitor.NodeMonitor, interval, lag time.Duration, wg *sync.WaitGroup, nodes ...string) {
+func startCallbackSub(ctx context.Context, m *monitor.NodeMonitor, interval, lag time.Duration, wg *sync.WaitGroup, isEvent bool, filter *ua.ExtensionObject, nodes ...string) {
+	fieldNames := []string{"EventId", "EventType", "Severity", "Time", "Message"}
 	sub, err := m.Subscribe(
 		ctx,
 		&opcua.SubscriptionParameters{
@@ -103,7 +168,7 @@ func startCallbackSub(ctx context.Context, m *monitor.NodeMonitor, interval, lag
 		},
 		func(s *monitor.Subscription, msg monitor.Message) {
 			switch v := msg.(type) {
-			case monitor.DataChangeMessage:
+			case *monitor.DataChangeMessage:
 				if v.Error != nil {
 					log.Printf("[callback] sub=%d error=%s", s.SubscriptionID(), v.Error)
 				} else {
@@ -113,33 +178,34 @@ func startCallbackSub(ctx context.Context, m *monitor.NodeMonitor, interval, lag
 						v.NodeID,
 						v.Value.Value())
 				}
-			case monitor.EventMessage:
+			case *monitor.EventMessage:
 				if v.Error != nil {
 					log.Printf("[callback] sub=%d error=%s", s.SubscriptionID(), v.Error)
 				} else {
-					log.Printf("[callback] sub=%d event fields=%v",
-						s.SubscriptionID(),
-						v.EventFields)
+					log.Printf("[callback] sub=%d event details:", s.SubscriptionID())
+					for i, field := range v.EventFields {
+						if i < len(fieldNames) {
+							fieldName := fieldNames[i]
+							log.Printf("  %s: %v", fieldName, field.Value.Value())
+						}
+					}
 				}
 			default:
 				log.Printf("[callback] sub=%d unknown message type=%T", s.SubscriptionID(), msg)
 			}
 			time.Sleep(lag)
 		},
-		nodes...)
-
+		isEvent, filter, nodes...)
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	defer cleanup(ctx, sub, wg)
-
 	<-ctx.Done()
 }
 
-func startChanSub(ctx context.Context, m *monitor.NodeMonitor, interval, lag time.Duration, wg *sync.WaitGroup, nodes ...string) {
+func startChanSub(ctx context.Context, m *monitor.NodeMonitor, interval, lag time.Duration, wg *sync.WaitGroup, isEvent bool, filter *ua.ExtensionObject, nodes ...string) {
 	ch := make(chan monitor.Message, 16)
-	sub, err := m.ChanSubscribe(ctx, &opcua.SubscriptionParameters{Interval: interval}, ch, nodes...)
+	sub, err := m.ChanSubscribe(ctx, &opcua.SubscriptionParameters{Interval: interval}, ch, isEvent, filter, nodes...)
 
 	if err != nil {
 		log.Fatal(err)
@@ -153,7 +219,7 @@ func startChanSub(ctx context.Context, m *monitor.NodeMonitor, interval, lag tim
 			return
 		case msg := <-ch:
 			switch v := msg.(type) {
-			case monitor.DataChangeMessage:
+			case *monitor.DataChangeMessage:
 				if v.Error != nil {
 					log.Printf("[channel] sub=%d error=%s", sub.SubscriptionID(), v.Error)
 				} else {
@@ -163,13 +229,13 @@ func startChanSub(ctx context.Context, m *monitor.NodeMonitor, interval, lag tim
 						v.NodeID,
 						v.Value.Value())
 				}
-			case monitor.EventMessage:
+			case *monitor.EventMessage:
 				if v.Error != nil {
 					log.Printf("[channel] sub=%d error=%s", sub.SubscriptionID(), v.Error)
 				} else {
-					log.Printf("[channel] sub=%d event fields=%v",
-						sub.SubscriptionID(),
-						v.EventFields)
+					out := v.EventFields[0].Value.Value()
+					log.Printf("[channel] sub=%d event fields=%d",
+						sub.SubscriptionID(), out)
 				}
 			default:
 				log.Printf("[channel] sub=%d unknown message type: %T", sub.SubscriptionID(), msg)

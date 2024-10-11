@@ -2,12 +2,14 @@ package monitor
 
 import (
 	"context"
-	"github.com/gopcua/opcua"
-	"github.com/gopcua/opcua/errors"
-	"github.com/gopcua/opcua/ua"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gopcua/opcua"
+	"github.com/gopcua/opcua/errors"
+	"github.com/gopcua/opcua/ua"
 )
 
 var (
@@ -100,7 +102,7 @@ func NewNodeMonitor(client *opcua.Client) (*NodeMonitor, error) {
 	return m, nil
 }
 
-func newSubscription(ctx context.Context, m *NodeMonitor, params *opcua.SubscriptionParameters, notifyChanLength int, nodes ...string) (*Subscription, error) {
+func newSubscription(ctx context.Context, m *NodeMonitor, params *opcua.SubscriptionParameters, notifyChanLength int, eventSub bool, filter *ua.ExtensionObject, nodes ...string) (*Subscription, error) {
 	if params == nil {
 		params = &opcua.SubscriptionParameters{}
 	}
@@ -118,10 +120,10 @@ func newSubscription(ctx context.Context, m *NodeMonitor, params *opcua.Subscrip
 		return nil, err
 	}
 
-	if err = s.AddNodes(ctx, nodes...); err != nil {
+	if err = s.AddNodes(ctx, eventSub, filter, nodes...); err != nil {
+		fmt.Printf("Nodes: %v\n", nodes)
 		return nil, err
 	}
-
 	return s, nil
 }
 
@@ -133,13 +135,13 @@ func (m *NodeMonitor) SetErrorHandler(cb ErrHandler) {
 // Subscribe creates a new callback-based subscription and an optional list of nodes.
 // The caller must call `Unsubscribe` to stop and clean up resources. Canceling the context
 // will also cause the subscription to stop, but `Unsubscribe` must still be called.
-func (m *NodeMonitor) Subscribe(ctx context.Context, params *opcua.SubscriptionParameters, cb MsgHandler, nodes ...string) (*Subscription, error) {
-	sub, err := newSubscription(ctx, m, params, DefaultCallbackBufferLen, nodes...)
+func (m *NodeMonitor) Subscribe(ctx context.Context, params *opcua.SubscriptionParameters, cb MsgHandler, eventSub bool, filter *ua.ExtensionObject, nodes ...string) (*Subscription, error) {
+	sub, err := newSubscription(ctx, m, params, DefaultCallbackBufferLen, eventSub, filter, nodes...)
 	if err != nil {
 		return nil, err
 	}
 
-	go sub.pump(ctx, nil, cb)
+	go sub.pump(ctx, nil, cb, true)
 
 	return sub, nil
 }
@@ -149,13 +151,12 @@ func (m *NodeMonitor) Subscribe(ctx context.Context, params *opcua.SubscriptionP
 // via the monitor's `ErrHandler`.
 // The caller must call `Unsubscribe` to stop and clean up resources. Canceling the context
 // will also cause the subscription to stop, but `Unsubscribe` must still be called.
-func (m *NodeMonitor) ChanSubscribe(ctx context.Context, params *opcua.SubscriptionParameters, ch chan<- Message, nodes ...string) (*Subscription, error) {
-	sub, err := newSubscription(ctx, m, params, 16, nodes...)
+func (m *NodeMonitor) ChanSubscribe(ctx context.Context, params *opcua.SubscriptionParameters, ch chan<- Message, eventSub bool, filter *ua.ExtensionObject, nodes ...string) (*Subscription, error) {
+	sub, err := newSubscription(ctx, m, params, 16, eventSub, filter, nodes...)
 	if err != nil {
 		return nil, err
 	}
-
-	go sub.pump(ctx, ch, nil)
+	go sub.pump(ctx, ch, nil, true)
 
 	return sub, nil
 }
@@ -167,7 +168,7 @@ func (s *Subscription) sendError(err error) {
 }
 
 // internal func to read from internal channel and write to client provided channel
-func (s *Subscription) pump(ctx context.Context, notifyCh chan<- Message, cb MsgHandler) {
+func (s *Subscription) pump(ctx context.Context, notifyCh chan<- Message, cb MsgHandler, sub bool) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -195,7 +196,6 @@ func (s *Subscription) pump(ctx context.Context, notifyCh chan<- Message, cb Msg
 					continue
 				}
 			}
-
 			switch v := msg.Value.(type) {
 			case *ua.DataChangeNotification:
 				for _, item := range v.MonitoredItems {
@@ -236,11 +236,13 @@ func (s *Subscription) pump(ctx context.Context, notifyCh chan<- Message, cb Msg
 					s.mu.RUnlock()
 
 					out := &EventMessage{}
-
 					if !ok {
 						out.Error = errors.Errorf("handle %d not found", item.ClientHandle)
 						// TODO: should the error also propagate via the monitor callback?
 					} else {
+						// Initialize the EventFields slice with the correct size
+						out.EventFields = make([]*ua.DataValue, len(item.EventFields))
+
 						for i, field := range item.EventFields {
 							// Create a new DataValue
 							dataValue := &ua.DataValue{
@@ -307,16 +309,16 @@ func (s *Subscription) Dropped() uint64 {
 }
 
 // AddNodes adds nodes defined by their string representation
-func (s *Subscription) AddNodes(ctx context.Context, nodes ...string) error {
+func (s *Subscription) AddNodes(ctx context.Context, eventSub bool, filter *ua.ExtensionObject, nodes ...string) error {
 	nodeIDs, err := parseNodeSlice(nodes...)
 	if err != nil {
 		return err
 	}
-	return s.AddNodeIDs(ctx, nodeIDs...)
+	return s.AddNodeIDs(ctx, eventSub, filter, nodeIDs...)
 }
 
 // AddNodeIDs adds nodes
-func (s *Subscription) AddNodeIDs(ctx context.Context, nodes ...*ua.NodeID) error {
+func (s *Subscription) AddNodeIDs(ctx context.Context, eventSub bool, filter *ua.ExtensionObject, nodes ...*ua.NodeID) error {
 	requests := make([]Request, len(nodes))
 
 	for i, node := range nodes {
@@ -325,18 +327,23 @@ func (s *Subscription) AddNodeIDs(ctx context.Context, nodes ...*ua.NodeID) erro
 			MonitoringMode: ua.MonitoringModeReporting,
 		}
 	}
-	_, err := s.AddMonitorItems(ctx, requests...)
+	var err error
+	if eventSub {
+		_, err = s.AddMonitorEvents(ctx, filter, requests...)
+	} else {
+		_, err = s.AddMonitorItems(ctx, filter, requests...)
+	}
 	return err
 }
 
 // AddMonitorItems adds nodes with monitoring parameters to the subscription
-func (s *Subscription) AddMonitorItems(ctx context.Context, nodes ...Request) ([]Item, error) {
+func (s *Subscription) AddMonitorItems(ctx context.Context, filter *ua.ExtensionObject, nodes ...Request) ([]Item, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if len(nodes) == 0 {
-		// some server implementionations allow an empty monitoreditemrequest, some don't.
-		// beter to just return
+		// some server implementations allow an empty monitoreditemrequest, some don't.
+		// better to just return
 		return nil, nil
 	}
 
@@ -348,7 +355,7 @@ func (s *Subscription) AddMonitorItems(ctx context.Context, nodes ...Request) ([
 		s.handles[handle] = nodes[i].NodeID
 		nodes[i].handle = handle
 
-		request := opcua.NewMonitoredItemCreateRequestWithDefaults(node.NodeID, ua.AttributeIDValue, handle)
+		request := opcua.NewMonitoredItemCreateRequestWithDefaults(node.NodeID, ua.AttributeIDValue, filter, handle)
 		request.MonitoringMode = node.MonitoringMode
 
 		if node.MonitoringParameters != nil {
@@ -382,7 +389,64 @@ func (s *Subscription) AddMonitorItems(ctx context.Context, nodes ...Request) ([
 		s.itemLookup[res.MonitoredItemID] = mn
 		monitoredItems = append(monitoredItems, mn)
 	}
+	return monitoredItems, nil
+}
 
+// AddMonitorItems adds nodes with monitoring parameters to the subscription
+func (s *Subscription) AddMonitorEvents(ctx context.Context, filter *ua.ExtensionObject, nodes ...Request) ([]Item, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(nodes) == 0 {
+		// some server implementionations allow an empty monitoreditemrequest, some don't.
+		// beter to just return
+		return nil, nil
+	}
+
+	toAdd := make([]*ua.MonitoredItemCreateRequest, 0)
+
+	// Add handles and make requests
+	for i, node := range nodes {
+		handle := atomic.AddUint32(&s.monitor.nextClientHandle, 1)
+		s.handles[handle] = nodes[i].NodeID
+		nodes[i].handle = handle
+
+		request := opcua.NewMonitoredItemCreateRequestForEvents(node.NodeID, filter, handle)
+		request.MonitoringMode = node.MonitoringMode
+
+		if node.MonitoringParameters != nil {
+			request.RequestedParameters = node.MonitoringParameters
+			request.RequestedParameters.ClientHandle = handle
+		}
+		toAdd = append(toAdd, request)
+	}
+	resp, err := s.sub.Monitor(ctx, ua.TimestampsToReturnBoth, toAdd...)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.ResponseHeader.ServiceResult != ua.StatusOK {
+		return nil, resp.ResponseHeader.ServiceResult
+	}
+
+	if len(resp.Results) != len(toAdd) {
+		return nil, errors.Errorf("monitor items response length mismatch")
+	}
+	var monitoredItems []Item
+	for i, res := range resp.Results {
+
+		if res.StatusCode != ua.StatusOK {
+			return nil, res.StatusCode
+		}
+		mn := Item{
+			id:     res.MonitoredItemID,
+			handle: nodes[i].handle,
+			nodeID: toAdd[i].ItemToMonitor.NodeID,
+		}
+		s.itemLookup[res.MonitoredItemID] = mn
+		monitoredItems = append(monitoredItems, mn)
+	}
 	return monitoredItems, nil
 }
 
@@ -465,12 +529,13 @@ func parseNodeSlice(nodes ...string) ([]*ua.NodeID, error) {
 	var err error
 
 	nodeIDs := make([]*ua.NodeID, len(nodes))
-
+	println("8.1")
 	for i, node := range nodes {
 		if nodeIDs[i], err = ua.ParseNodeID(node); err != nil {
+			println("8.2")
 			return nil, err
 		}
 	}
-
+	println("8.3")
 	return nodeIDs, nil
 }
