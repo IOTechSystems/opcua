@@ -87,6 +87,7 @@ func TestAutoReconnection(t *testing.T) {
 		&opcua.SubscriptionParameters{Interval: opcua.DefaultSubscriptionInterval},
 		ch,
 		false,
+		nil,
 		currentTimeNodeID,
 	)
 	require.NoError(t, err, "ChanSubscribe failed")
