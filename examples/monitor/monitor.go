@@ -141,11 +141,11 @@ func main() {
 	if *event {
 		// start callback-based subscription
 		wg.Add(1)
-		go startCallbackSub(ctx, m, *interval, 0, wg, *event, filterExtObj, *nodeID)
+		go startCallbackSub(ctx, m, *interval, 0, wg, *event, &filterExtObj, *nodeID)
 
 		// start channel-based subscription
 		wg.Add(1)
-		go startChanSub(ctx, m, *interval, 0, wg, *event, filterExtObj, *nodeID)
+		go startChanSub(ctx, m, *interval, 0, wg, *event, &filterExtObj, *nodeID)
 	} else {
 		// start callback-based subscription
 		wg.Add(1)
