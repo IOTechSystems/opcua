@@ -633,13 +633,10 @@ func parseNodeSlice(nodes ...string) ([]*ua.NodeID, error) {
 	var err error
 
 	nodeIDs := make([]*ua.NodeID, len(nodes))
-	println("8.1")
 	for i, node := range nodes {
 		if nodeIDs[i], err = ua.ParseNodeID(node); err != nil {
-			println("8.2")
 			return nil, err
 		}
 	}
-	println("8.3")
 	return nodeIDs, nil
 }
