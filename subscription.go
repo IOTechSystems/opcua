@@ -142,7 +142,7 @@ func (s *Subscription) ModifySubscription(ctx context.Context, params Subscripti
 		Priority:                    params.Priority,
 	}
 	var res *ua.ModifySubscriptionResponse
-	err := s.c.Send(ctx, req, func(v interface{}) error {
+	err := s.c.Send(ctx, req, func(v ua.Response) error {
 		return safeAssign(v, &res)
 	})
 	if err != nil {
