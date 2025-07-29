@@ -51,6 +51,7 @@ type monitoredItem struct {
 	ts  ua.TimestampsToReturn
 }
 
+// Deprectated: Use NewDefaultMonitoredItemCreateRequest instead. Will be removed with 0.8.1
 func NewMonitoredItemCreateRequestWithDefaults(nodeID *ua.NodeID, attributeID ua.AttributeID, clientHandle uint32) *ua.MonitoredItemCreateRequest {
 	if attributeID == 0 {
 		attributeID = ua.AttributeIDValue
@@ -76,6 +77,51 @@ type PublishNotificationData struct {
 	SubscriptionID uint32
 	Error          error
 	Value          interface{}
+	PublishTime    time.Time
+}
+
+type MonitoredItemCreateRequestArgs struct {
+	NodeID           *ua.NodeID
+	AttributeID      ua.AttributeID
+	ClientHandle     uint32
+	Filter           *ua.ExtensionObject
+	MonitoringMode   *ua.MonitoringMode
+	DiscardOldest    *bool
+	QueueSize        *uint32
+	SamplingInterval float64
+}
+
+func NewDefaultMonitoredItemCreateRequest(args MonitoredItemCreateRequestArgs) *ua.MonitoredItemCreateRequest {
+	if args.AttributeID == 0 {
+		args.AttributeID = ua.AttributeIDValue
+	}
+	if args.MonitoringMode == nil {
+		monitoringMode := ua.MonitoringModeReporting
+		args.MonitoringMode = &monitoringMode
+	}
+	if args.QueueSize == nil {
+		queueSize := uint32(10)
+		args.QueueSize = &queueSize
+	}
+	if args.DiscardOldest == nil {
+		discardOldest := true
+		args.DiscardOldest = &discardOldest
+	}
+	return &ua.MonitoredItemCreateRequest{
+		ItemToMonitor: &ua.ReadValueID{
+			NodeID:       args.NodeID,
+			AttributeID:  args.AttributeID,
+			DataEncoding: &ua.QualifiedName{},
+		},
+		MonitoringMode: *args.MonitoringMode,
+		RequestedParameters: &ua.MonitoringParameters{
+			ClientHandle:     args.ClientHandle,
+			DiscardOldest:    *args.DiscardOldest,
+			Filter:           args.Filter,
+			QueueSize:        *args.QueueSize,
+			SamplingInterval: args.SamplingInterval,
+		},
+	}
 }
 
 // Cancel stops the subscription and removes it
